@@ -12,6 +12,7 @@ from openai import OpenAI
 load_dotenv()
 client = OpenAI()
 MODEL = "gpt-6-luna"   # 호출마다 reasoning_effort="none" 을 함께 넣는다 (교재 5.3)
+MAX_TURNS = 3
 
 # 상태
 history = []
@@ -29,19 +30,20 @@ def reset():
 
 def chat(message: str, temperature: float = 0.3) -> str:
     """사용자 메시지에 대한 챗봇 응답 생성."""
-    global history, usage_log, SYSTEM
-    
-    history.append({"role": "user", "content": message})
+    current_history = [*history, {"role": "user", "content": message}]
+    if len(current_history) > MAX_TURNS * 2:
+        del current_history[:2]
     
     resp = client.chat.completions.create(
         model=MODEL,
         reasoning_effort="none",
         temperature=temperature,
-        messages=[{"role": "system", "content": SYSTEM}, *history],
+        messages=[{"role": "system", "content": SYSTEM}, *current_history],
     )
     
     answer = resp.choices[0].message.content
-    history.append({"role": "assistant", "content": answer})
+    current_history.append({"role": "assistant", "content": answer})
+    history[:] = current_history
     usage_log.append(resp.usage.total_tokens)
     
     return answer
