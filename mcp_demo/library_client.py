@@ -1,26 +1,28 @@
-"""실습 6 Task 3 — MCP 클라이언트 한 입 (컨테이너 안에서 완결).
+"""MCP 도서관 서버에 연결해 자연어 질문을 받는 대화형 클라이언트.
 
-`library_server.py` 를 stdio 로 직접 띄워 MCP 표준으로 통신한다.
-**Codex CLI 등 외부 호스트 없이** 이 한 파일로 MCP 의 전 과정을 체험한다:
-  1) 서버 연결 + 핸드셰이크(initialize)
-  2) 서버가 제공하는 도구 목록 조회(list_tools)
-  3) 도구 호출(call_tool) — search_book / loan_status
-  4) 리소스 읽기(read_resource) — config://library
-
-실행 (컨테이너 터미널):
-    python mcp_demo/library_client.py
-
-> 이것이 Codex CLI·Cursor 같은 'MCP 호스트' 가 내부적으로 하는 일과 똑같다.
-> 차이는 호스트가 그 결과를 LLM 컨텍스트로 넘긴다는 점뿐.
+실행: python mcp_demo/library_client.py
+명령어: /reset (대화 초기화), /quit (종료)
 """
 import asyncio
+import re
 import sys
 from pathlib import Path
+from typing import Any, Optional
 
-from pydantic import AnyUrl
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_core.tools import StructuredTool
+from langchain_openai import ChatOpenAI
+from pydantic import Field, create_model
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+load_dotenv()
+
+MODEL = "gpt-6-luna"
+MAX_TURNS = 3
+SYSTEM = "너는 도서관 도우미다. 도서 검색이나 회원 대출 현황 질문에는 연결된 MCP 도구를 사용해 정확히 답한다."
 
 # 같은 폴더의 서버를 현재 파이썬으로 실행 (CWD 와 무관하게 동작)
 SERVER = Path(__file__).resolve().parent / "library_server.py"
@@ -35,35 +37,122 @@ def _text(result) -> str:
     return "\n".join(parts) if parts else str(result)
 
 
+def _args_model(tool) -> type:
+    """MCP 도구의 JSON Schema 입력 정의를 Pydantic 모델로 변환한다."""
+    schema = getattr(tool, "inputSchema", {}) or {}
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    json_types = {
+        "string": str,
+        "integer": int,
+        "number": float,
+        "boolean": bool,
+        "object": dict,
+        "array": list,
+    }
+
+    fields = {}
+    for name, definition in properties.items():
+        annotation = json_types.get(definition.get("type"), Any)
+        description = definition.get("description", "")
+        if name in required:
+            fields[name] = (annotation, Field(..., description=description))
+        else:
+            fields[name] = (Optional[annotation], Field(None, description=description))
+
+    model_name = re.sub(r"\W", "_", tool.name.title()) + "Args"
+    return create_model(model_name, **fields)
+
+
+def _make_mcp_tool(session: ClientSession, mcp_tool) -> StructuredTool:
+    """MCP 도구 하나를 LangChain 에이전트가 호출할 수 있게 감싼다."""
+    async def call_mcp(**arguments):
+        result = await session.call_tool(mcp_tool.name, arguments)
+        text = _text(result)
+        if getattr(result, "isError", False):
+            raise RuntimeError(text)
+        return text
+
+    return StructuredTool.from_function(
+        name=mcp_tool.name,
+        description=mcp_tool.description or f"MCP tool: {mcp_tool.name}",
+        args_schema=_args_model(mcp_tool),
+        coroutine=call_mcp,
+    )
+
+
+def _message_text(message) -> str:
+    """LangChain 메시지에서 텍스트 답변을 꺼낸다."""
+    text = getattr(message, "text", None)
+    if text:
+        return text
+
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    return str(content)
+
+
 async def main() -> None:
-    print(f"==> MCP 서버 실행: {SERVER.name}\n")
+    print(f"==> MCP 도서관 서버 연결: {SERVER.name}")
     async with stdio_client(SERVER_PARAMS) as (read, write):
         async with ClientSession(read, write) as session:
-            # 1) 핸드셰이크
             info = await session.initialize()
-            print(f"[1] 연결됨 — 서버: {info.serverInfo.name}\n")
+            server_name = info.serverInfo.name
+            mcp_tools = (await session.list_tools()).tools
+            if not mcp_tools:
+                print(f"서버 {server_name}에서 사용할 수 있는 도구가 없습니다.")
+                return
 
-            # 2) 도구 목록 — 서버의 docstring 이 LLM 이 읽는 '설명' 이 된다
-            tools = await session.list_tools()
-            print("[2] 제공 도구:")
-            for t in tools.tools:
-                print(f"    - {t.name}: {t.description}")
-            print()
+            tools = [_make_mcp_tool(session, tool) for tool in mcp_tools]
+            llm = ChatOpenAI(model=MODEL, reasoning_effort="none", temperature=0)
+            agent = create_agent(llm, tools, system_prompt=SYSTEM)
 
-            # 3) 도구 호출 — LLM(또는 우리)이 인자를 채워 호출
-            r1 = await session.call_tool("search_book", {"query": "해리포터"})
-            print("[3] search_book('해리포터') →", _text(r1))
+            print(f"==> 연결됨 — 서버: {server_name}")
+            print("사용 가능한 도구:")
+            for tool in mcp_tools:
+                print(f"  - {tool.name}: {tool.description}")
+            print("질문을 입력하세요. /reset 으로 대화를 초기화하고 /quit 으로 종료합니다.\n")
 
-            r2 = await session.call_tool("loan_status", {"member_id": "M021"})
-            print("    loan_status('M021')  →", _text(r2))
-            print()
+            history = []
+            while True:
+                try:
+                    question = input("You: ").strip()
+                except EOFError:
+                    print()
+                    break
 
-            # 4) 리소스 읽기
-            res = await session.read_resource(AnyUrl("config://library"))
-            print("[4] resource config://library →", res.contents[0].text)
+                if not question:
+                    continue
+                if question == "/reset":
+                    history.clear()
+                    print("(대화 초기화)\n")
+                    continue
+                if question == "/quit":
+                    print("(대화 종료)")
+                    break
 
-    print("\n==> 완료. 같은 도구가 Codex CLI 같은 외부 호스트에서도 동일하게 보인다.")
+                current_history = [*history, {"role": "user", "content": question}]
+                if len(current_history) > MAX_TURNS * 2:
+                    del current_history[:2]
+
+                try:
+                    result = await agent.ainvoke({"messages": current_history})
+                    answer = _message_text(result["messages"][-1])
+                    current_history.append({"role": "assistant", "content": answer})
+                    history = current_history
+                    print(f"Bot: {answer}\n")
+                except Exception as error:
+                    print(f"오류 발생: {error}\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n(Ctrl+C로 종료)")
