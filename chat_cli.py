@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""
-멀티턴 채팅 CLI — OpenAI 기반 대화 메모리 챗봇
+"""멀티턴 LangChain 채팅 CLI.
+
 Usage: python chat_cli.py
-명령어: /reset (초기화), /quit (종료)
+명령어: /reset (초기화), /stats (통계), /quit (종료)
 """
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-# 초기화
 load_dotenv()
-client = OpenAI()
-MODEL = "gpt-6-luna"   # 호출마다 reasoning_effort="none" 을 함께 넣는다 (교재 5.3)
+MODEL = "gpt-6-luna"
 MAX_TURNS = 3
+SYSTEM = "당신은 친절한 AI 어시스턴트입니다. 모르면 '확인 필요'라고만 답하세요."
 
-# 상태
+# 노트북의 LangChain 예제와 같은 모델 설정
+llm = ChatOpenAI(model=MODEL, reasoning_effort="none", temperature=0.3)
+
+# 상태: 최근 대화는 role/content dict로 보관하고 호출 직전에 LangChain 메시지로 변환
 history = []
 usage_log = []
-SYSTEM = "당신은 친절한 AI 어시스턴트입니다. 모르면 '확인 필요'라고만 답하세요."
 
 
 def reset():
@@ -33,19 +35,24 @@ def chat(message: str, temperature: float = 0.3) -> str:
     current_history = [*history, {"role": "user", "content": message}]
     if len(current_history) > MAX_TURNS * 2:
         del current_history[:2]
-    
-    resp = client.chat.completions.create(
-        model=MODEL,
-        reasoning_effort="none",
-        temperature=temperature,
-        messages=[{"role": "system", "content": SYSTEM}, *current_history],
-    )
-    
-    answer = resp.choices[0].message.content
+
+    messages = [SystemMessage(content=SYSTEM)]
+    for item in current_history:
+        message_class = HumanMessage if item["role"] == "user" else AIMessage
+        messages.append(message_class(content=item["content"]))
+
+    response = llm.bind(temperature=temperature).invoke(messages)
+    answer = response.content
     current_history.append({"role": "assistant", "content": answer})
     history[:] = current_history
-    usage_log.append(resp.usage.total_tokens)
-    
+
+    # LangChain OpenAI 응답은 usage_metadata를 제공한다. 구버전 호환을 위해
+    # response_metadata의 token_usage도 확인한다.
+    token_usage = getattr(response, "usage_metadata", None)
+    if not token_usage:
+        token_usage = getattr(response, "response_metadata", {}).get("token_usage", {})
+    usage_log.append(token_usage.get("total_tokens"))
+
     return answer
 
 
@@ -54,12 +61,18 @@ def show_stats():
     if not usage_log:
         print("(아직 메시지 없음)")
         return
-    
+
     PRICE = 0.30 / 1_000_000  # 입출력 혼합 평균
-    total = sum(usage_log)
-    per_turn = total / len(usage_log)
-    
     print(f"  턴 수: {len(usage_log)}")
+    measured_usage = [tokens for tokens in usage_log if tokens is not None]
+    if not measured_usage:
+        print("  토큰 사용량: 모델 응답에서 제공되지 않음")
+        return
+
+    total = sum(measured_usage)
+    per_turn = total / len(measured_usage)
+    if len(measured_usage) < len(usage_log):
+        print(f"  사용량 확인된 턴: {len(measured_usage)}/{len(usage_log)}")
     print(f"  누적 토큰: {total}")
     print(f"  누적 비용: ${total * PRICE:.5f}")
     print(f"  평균 턴당: {per_turn:.1f} tokens")
